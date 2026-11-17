@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::fs::File;
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
@@ -31,9 +32,13 @@ enum Mode {
 #[derive(Debug, Parser)]
 #[command(version)]
 struct Cli {
-    /// CS2 demo file(s) (.dem)
+    /// CS2 demo file(s) (.dem). Use `-` to stream a demo from stdin.
     #[arg(required = true)]
     demos: Vec<PathBuf>,
+
+    /// Base name for output files when reading from stdin. Default: "stdin".
+    #[arg(long, value_name = "STEM")]
+    name: Option<String>,
 
     /// SteamID64 of the player(s) to extract. Repeat or comma-separate. Default: everyone.
     #[arg(short, long = "steam-id", value_delimiter = ',')]
@@ -66,6 +71,10 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if cli.demos.iter().filter(|d| is_stdin(d)).count() > 1 {
+        eprintln!("error: stdin (-) can only be given once");
+        return ExitCode::from(1);
+    }
     let mut json_items = Vec::new();
     let mut found_any = false;
     let mut failed = false;
@@ -101,10 +110,14 @@ fn main() -> ExitCode {
 /// Returns (json, found_voice).
 fn process(cli: &Cli, demo_path: &Path) -> Result<(String, bool)> {
     let started = Instant::now();
-    let data = std::fs::read(demo_path).with_context(|| "could not read demo")?;
     let wanted = &cli.steam_ids;
-    let scan = demo::scan(&data, &|xuid| wanted.is_empty() || wanted.contains(&xuid))?;
-    drop(data);
+    let want = |xuid| wanted.is_empty() || wanted.contains(&xuid);
+    let scan = if is_stdin(demo_path) {
+        demo::scan_reader(BufReader::with_capacity(1 << 20, std::io::stdin().lock()), &want)?
+    } else {
+        let file = File::open(demo_path).context("could not open demo")?;
+        demo::scan_reader(BufReader::with_capacity(1 << 20, file), &want)?
+    };
     if scan.truncated {
         eprintln!("warning: {}: demo is truncated, extracted what was there", demo_path.display());
     }
@@ -123,7 +136,11 @@ fn process(cli: &Cli, demo_path: &Path) -> Result<(String, bool)> {
         tick_interval: scan.tick_interval,
     };
     let demo_secs = timeline.end_tick.saturating_sub(timeline.origin_tick) as f64 * scan.tick_interval as f64;
-    let stem = demo_path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+    let stem = match (&cli.name, is_stdin(demo_path)) {
+        (Some(n), true) => n.clone(),
+        (None, true) => "stdin".to_string(),
+        _ => demo_path.file_stem().unwrap_or_default().to_string_lossy().into_owned(),
+    };
 
     for id in wanted {
         if !tracks.contains_key(id) {
@@ -133,17 +150,20 @@ fn process(cli: &Cli, demo_path: &Path) -> Result<(String, bool)> {
 
     let mut players_json = Vec::new();
     let mut files: BTreeMap<u64, PathBuf> = BTreeMap::new();
+    let mut timing: BTreeMap<u64, voice::Rendered> = BTreeMap::new();
+    // Segment file offsets refer to the layout of the file that is (or would be) written.
+    let layout = if matches!(cli.mode, Mode::Compact) { Layout::Compact } else { Layout::Full };
 
     if !cli.list && !tracks.is_empty() {
         std::fs::create_dir_all(&cli.out).context("could not create output directory")?;
         let ext = cli.format.trim_start_matches('.').to_ascii_lowercase();
         match cli.mode {
             Mode::Full | Mode::Compact => {
-                let layout = if matches!(cli.mode, Mode::Full) { Layout::Full } else { Layout::Compact };
                 for (&id, track) in &tracks {
                     let path = cli.out.join(format!("{stem}_{id}.{ext}"));
-                    let ogg = render_track(id, track, layout, &timeline, &stem)?;
+                    let (ogg, info) = render_track(id, track, layout, &timeline, &stem)?;
                     write_output(cli, &ogg, &path, &ext)?;
+                    timing.insert(id, info);
                     files.insert(id, path);
                 }
             }
@@ -158,7 +178,27 @@ fn process(cli: &Cli, demo_path: &Path) -> Result<(String, bool)> {
     }
 
     for (&id, track) in &tracks {
+        if let std::collections::btree_map::Entry::Vacant(e) = timing.entry(id) {
+            e.insert(voice::render(track, layout, &timeline, std::io::sink(), 0, &[])?);
+        }
+    }
+
+    for (&id, track) in &tracks {
         let secs = track.voice_samples() as f64 / 48000.0;
+        let segments = timing[&id]
+            .segments
+            .iter()
+            .map(|s| {
+                format!(
+                    "{{\"tick\":{},\"start\":{:.3},\"duration\":{:.3},\"file_offset\":{:.3}}}",
+                    s.tick,
+                    s.demo_start as f64 / 48000.0,
+                    s.samples as f64 / 48000.0,
+                    s.file_start as f64 / 48000.0
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         let file = files.get(&id);
         if !cli.json {
             match file {
@@ -167,7 +207,7 @@ fn process(cli: &Cli, demo_path: &Path) -> Result<(String, bool)> {
             }
         }
         players_json.push(format!(
-            "{{\"steam_id\":\"{id}\",\"voice_seconds\":{secs:.2},\"file\":{}}}",
+            "{{\"steam_id\":\"{id}\",\"voice_seconds\":{secs:.2},\"file\":{},\"segments\":[{segments}]}}",
             file.map(|f| json_str(&f.display().to_string())).unwrap_or_else(|| "null".into())
         ));
     }
@@ -185,20 +225,32 @@ fn process(cli: &Cli, demo_path: &Path) -> Result<(String, bool)> {
     }
 
     let json = format!(
-        "{{\"demo\":{},\"map\":{},\"duration_seconds\":{demo_secs:.2},\"tick_interval\":{},\"players\":[{}]}}",
+        "{{\"demo\":{},\"map\":{},\"duration_seconds\":{demo_secs:.2},\"tick_interval\":{},\"start_tick\":{},\"end_tick\":{},\"players\":[{}]}}",
         json_str(&demo_path.display().to_string()),
         scan.map_name.as_deref().map(json_str).unwrap_or_else(|| "null".into()),
         scan.tick_interval,
+        timeline.origin_tick,
+        timeline.end_tick,
         players_json.join(",")
     );
     Ok((json, !tracks.is_empty()))
 }
 
-fn render_track(id: u64, track: &Track, layout: Layout, timeline: &Timeline, stem: &str) -> Result<Vec<u8>> {
+fn render_track(
+    id: u64,
+    track: &Track,
+    layout: Layout,
+    timeline: &Timeline,
+    stem: &str,
+) -> Result<(Vec<u8>, voice::Rendered)> {
     let comments = vec![format!("TITLE={stem} {id}"), format!("STEAMID={id}")];
     let mut buf = Vec::new();
-    voice::render(track, layout, timeline, &mut buf, id as u32, &comments)?;
-    Ok(buf)
+    let info = voice::render(track, layout, timeline, &mut buf, id as u32, &comments)?;
+    Ok((buf, info))
+}
+
+fn is_stdin(p: &Path) -> bool {
+    p.as_os_str() == "-"
 }
 
 fn is_native(ext: &str) -> bool {
@@ -232,7 +284,7 @@ fn merge(cli: &Cli, tracks: &BTreeMap<u64, Track>, timeline: &Timeline, stem: &s
         let mut cmd = ffmpeg_cmd(cli);
         for (&id, track) in tracks {
             let p = tmp.join(format!("{id}.ogg"));
-            std::fs::write(&p, render_track(id, track, Layout::Full, timeline, stem)?)?;
+            std::fs::write(&p, render_track(id, track, Layout::Full, timeline, stem)?.0)?;
             cmd.arg("-i").arg(&p);
         }
         let n = tracks.len();

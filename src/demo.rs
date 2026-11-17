@@ -6,6 +6,8 @@
 //! interval) and `svc_VoiceData`. Every other net message is skipped by its length
 //! prefix without being looked at.
 
+use std::io::{self, Read};
+
 use anyhow::{Context, Result, bail};
 
 use crate::bits::BitReader;
@@ -56,8 +58,43 @@ pub struct DemoScan {
 /// Scans a demo held in memory. `want(xuid)` lets the caller drop voice of
 /// players it doesn't care about early.
 pub fn scan(data: &[u8], want: &dyn Fn(u64) -> bool) -> Result<DemoScan> {
-    if data.len() < 16 || &data[..8] != MAGIC {
-        if data.starts_with(b"HL2DEMO\0") {
+    scan_reader(data, want)
+}
+
+/// Reads one varint from a stream. `Ok(None)` is a clean EOF before the first byte;
+/// EOF in the middle of a varint is reported as `UnexpectedEof`.
+fn read_varint_io<R: Read>(r: &mut R, consumed: &mut u64) -> io::Result<Option<u64>> {
+    let mut result: u64 = 0;
+    for i in 0..10 {
+        let mut b = [0u8; 1];
+        if r.read(&mut b)? == 0 {
+            if i == 0 {
+                return Ok(None);
+            }
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        *consumed += 1;
+        result |= ((b[0] & 0x7f) as u64) << (7 * i);
+        if b[0] & 0x80 == 0 {
+            return Ok(Some(result));
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::InvalidData, "varint too long"))
+}
+
+/// Scans a demo from a stream (a file, stdin, a socket, ...), one frame at a time,
+/// so the demo never has to be held in memory. Pass a buffered reader.
+pub fn scan_reader<R: Read>(mut r: R, want: &dyn Fn(u64) -> bool) -> Result<DemoScan> {
+    let mut header = [0u8; 16];
+    let mut got = 0;
+    while got < header.len() {
+        match r.read(&mut header[got..]).context("could not read demo")? {
+            0 => break,
+            n => got += n,
+        }
+    }
+    if got < 16 || &header[..8] != MAGIC {
+        if header[..got].starts_with(b"HL2DEMO\0") {
             bail!("this is a CS:GO demo (HL2DEMO), only CS2 demos (PBDEMS2) are supported");
         }
         bail!("not a CS2 demo (missing PBDEMS2 header)");
@@ -69,24 +106,35 @@ pub fn scan(data: &[u8], want: &dyn Fn(u64) -> bool) -> Result<DemoScan> {
     };
     let mut decoder = snap::raw::Decoder::new();
     let mut buf: Vec<u8> = Vec::new();
-    let mut pos = 16usize;
+    let mut payload_buf: Vec<u8> = Vec::new();
+    let mut pos = 16u64;
 
     loop {
         let frame_start = pos;
-        let (Some(cmd), Some(tick), Some(size)) = (
-            proto::read_varint(data, &mut pos),
-            proto::read_varint(data, &mut pos),
-            proto::read_varint(data, &mut pos),
-        ) else {
-            out.truncated = pos < data.len();
-            break;
+        let header = (|| -> io::Result<Option<(u64, u64, u64)>> {
+            let Some(cmd) = read_varint_io(&mut r, &mut pos)? else { return Ok(None) };
+            let tick = read_varint_io(&mut r, &mut pos)?.ok_or(io::ErrorKind::UnexpectedEof)?;
+            let size = read_varint_io(&mut r, &mut pos)?.ok_or(io::ErrorKind::UnexpectedEof)?;
+            Ok(Some((cmd, tick, size)))
+        })();
+        let (cmd, tick, size) = match header {
+            Ok(Some(h)) => h,
+            Ok(None) => break,
+            Err(e) if matches!(e.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData) => {
+                out.truncated = true;
+                break;
+            }
+            Err(e) => return Err(e).context("could not read demo"),
         };
         let size = size as usize;
-        let Some(payload) = data.get(pos..pos.saturating_add(size)) else {
+        payload_buf.clear();
+        let n = (&mut r).take(size as u64).read_to_end(&mut payload_buf).context("could not read demo")?;
+        if n < size {
             out.truncated = true;
             break;
-        };
-        pos += size;
+        }
+        pos += size as u64;
+        let payload = &payload_buf[..];
 
         let compressed = cmd & DEM_IS_COMPRESSED != 0;
         let cmd = cmd & !DEM_IS_COMPRESSED;

@@ -37,9 +37,14 @@ cs2-voice-extractor match.dem -s 76561197962803240 -m full -o voice/
 
 # Everyone mixed into a single mp3 (requires ffmpeg)
 cs2-voice-extractor match.dem -m merge -f mp3 -o voice/
+
+# Stream a demo from stdin (e.g. straight from a download or an archive)
+curl -s https://example.com/match.dem | cs2-voice-extractor - --name match -o voice/
 ```
 
-Files are named `<demo>_<steamid64>.<ext>`, or `<demo>.<ext>` in merge mode.
+Files are named `<demo>_<steamid64>.<ext>`, or `<demo>.<ext>` in merge mode. When reading
+from stdin (`-`) the demo name is `stdin` unless `--name` is given. The demo is scanned as it
+streams in, so it is never held in memory.
 
 ### Modes
 
@@ -59,6 +64,7 @@ Files are named `<demo>_<steamid64>.<ext>`, or `<demo>.<ext>` in merge mode.
 | `-o, --out <DIR>` | `.` | Output directory, created if missing. |
 | `-l, --list` | | List players with voice, don't write files. |
 | `--json` | | Print a machine-readable summary to stdout. Logs go to stderr. |
+| `--name <STEM>` | `stdin` | Base name for output files when the demo is read from stdin. |
 | `--ffmpeg <PATH>` | `ffmpeg` | ffmpeg binary, if it's not on `PATH`. |
 
 Multiple demos can be passed at once.
@@ -69,8 +75,16 @@ Multiple demos can be passed at once.
 
 ```json
 [{"demo":"match.dem","map":"de_anubis","duration_seconds":1688.20,"tick_interval":0.015625,
-  "players":[{"steam_id":"76561197962803240","voice_seconds":10.61,"file":"voice/match_76561197962803240.ogg"}]}]
+  "start_tick":0,"end_tick":108045,
+  "players":[{"steam_id":"76561197962803240","voice_seconds":10.61,"file":"voice/match_76561197962803240.ogg",
+    "segments":[{"tick":1520,"start":23.750,"duration":2.140,"file_offset":0.000}]}]}]
 ```
+
+`segments` is the timing metadata: one entry per stretch of speech, with the demo tick it
+started at, its `start` in demo seconds (from `start_tick`), its `duration`, and where it
+sits in the written file (`file_offset`, seconds). In `compact` mode this maps the
+back-to-back audio back to demo time; in `full`/`merge` mode `file_offset` equals `start` (later only if a player's packets overlap).
+Segments are reported with `--list` too, for the layout `--mode` selects.
 
 Exit codes: `0` success · `1` error · `2` no voice found.
 
@@ -117,8 +131,9 @@ cargo build --release
 cargo test
 ```
 
-The project is also a library crate (`cs2_voice_extractor`): `demo::scan` returns the raw voice
-messages and `voice::render` writes them to Ogg Opus.
+The project is also a library crate (`cs2_voice_extractor`): `demo::scan` (in memory) or
+`demo::scan_reader` (any `Read`, streamed) returns the raw voice messages, and `voice::render`
+writes them to Ogg Opus and returns the segment timing.
 
 ## Releases
 

@@ -63,18 +63,26 @@ pub fn collect(msgs: &[VoiceMessage]) -> (BTreeMap<u64, Track>, CollectStats) {
     (tracks, stats)
 }
 
-/// Returns Some(lost packet count) for an in-order sequence number, None for a duplicate/stale one.
-fn advance_seq(prev: &mut Option<u32>, seq: u32, wrap: u32) -> Option<u32> {
+/// A sequence number at most this far behind the last one is a duplicate or a
+/// late retransmission and is dropped. Anything further back means the sender's
+/// counter was reset (e.g. the player reconnected) and starts a new stream.
+const STALE_WINDOW: u64 = 64;
+
+/// Returns Some(lost packet count) for an in-order sequence number, None for a
+/// duplicate/stale one. `wrap` is the counter's modulus (2^16 or 2^32).
+fn advance_seq(prev: &mut Option<u32>, seq: u32, wrap: u64) -> Option<u32> {
     let Some(p) = *prev else {
         *prev = Some(seq);
         return Some(0);
     };
-    let delta = seq.wrapping_sub(p) % wrap;
-    if delta == 0 || delta > wrap / 2 {
+    let forward = (seq as u64).wrapping_sub(p as u64) & (wrap - 1);
+    let backward = (p as u64).wrapping_sub(seq as u64) & (wrap - 1);
+    if forward == 0 || backward <= STALE_WINDOW {
         return None;
     }
     *prev = Some(seq);
-    Some(delta - 1)
+    // A counter reset (or a huge jump) is a new transmission, not packet loss.
+    Some(if forward > wrap / 2 { u32::MAX } else { (forward - 1) as u32 })
 }
 
 fn push(track: &mut Track, tick: u32, data: &[u8], lost: u32, stats: &mut CollectStats) {
@@ -91,7 +99,7 @@ fn push(track: &mut Track, tick: u32, data: &[u8], lost: u32, stats: &mut Collec
 fn collect_opus(m: &VoiceMessage, track: &mut Track, stats: &mut CollectStats) {
     let mut lost = 0;
     if let Some(seq) = m.sequence {
-        match advance_seq(&mut track.seq, seq, u32::MAX) {
+        match advance_seq(&mut track.seq, seq, 1 << 32) {
             Some(l) => lost = l,
             None => {
                 stats.duplicates += 1;
@@ -188,7 +196,32 @@ impl Timeline {
     }
 }
 
-/// Writes one player's track as an Ogg Opus stream. Returns total duration in samples.
+/// Packets more than this far apart in demo time (48 kHz samples) start a new segment.
+const SEGMENT_GAP: u64 = 48000 / 4;
+
+/// One continuous stretch of speech: where it happened in the demo and where it
+/// sits in the rendered file. All values in 48 kHz samples / demo ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Segment {
+    /// Demo tick of the first packet.
+    pub tick: u32,
+    /// Position in demo time (relative to the timeline origin).
+    pub demo_start: u64,
+    /// Position in the rendered file.
+    pub file_start: u64,
+    /// Length in the rendered file, including filled packet loss.
+    pub samples: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Rendered {
+    /// Total duration of the file in samples.
+    pub total_samples: u64,
+    pub segments: Vec<Segment>,
+}
+
+/// Writes one player's track as an Ogg Opus stream, returning its duration and the
+/// timing of each speech segment (to map file time back to demo time).
 pub fn render<W: Write>(
     track: &Track,
     layout: Layout,
@@ -196,7 +229,10 @@ pub fn render<W: Write>(
     w: W,
     serial: u32,
     comments: &[String],
-) -> io::Result<u64> {
+) -> io::Result<Rendered> {
+    let mut segments: Vec<Segment> = Vec::new();
+    // End of the previous packet in demo time, to detect where a new segment starts.
+    let mut demo_end: Option<u64> = None;
     let mut ogg = OggOpusWriter::new(w, serial, comments)?;
     let mut err = None;
     let mut fill = |ogg: &mut OggOpusWriter<W>, n: u64| {
@@ -210,15 +246,24 @@ pub fn render<W: Write>(
     };
 
     for p in &track.packets {
+        let target = timeline.sample_at(p.tick);
+        let new_segment = demo_end.is_none_or(|end| target > end + SEGMENT_GAP);
         fill(&mut ogg, p.loss_before as u64);
         if layout == Layout::Full {
-            let target = timeline.sample_at(p.tick);
             let cursor = ogg.samples_written();
             if target > cursor {
                 fill(&mut ogg, target - cursor);
             }
         }
+        let file_pos = ogg.samples_written();
+        if new_segment {
+            segments.push(Segment { tick: p.tick, demo_start: target, file_start: file_pos, samples: 0 });
+        }
         ogg.write_packet(&p.data, p.samples)?;
+        let seg = segments.last_mut().unwrap();
+        seg.samples = ogg.samples_written() - seg.file_start;
+        let prev = demo_end.map_or(0, |e| e + p.loss_before as u64);
+        demo_end = Some(prev.max(target) + p.samples as u64);
     }
     if layout == Layout::Full {
         let end = timeline.sample_at(timeline.end_tick);
@@ -230,7 +275,46 @@ pub fn render<W: Write>(
     if let Some(e) = err {
         return Err(e);
     }
-    let total = ogg.samples_written();
+    let total_samples = ogg.samples_written();
     ogg.finish()?;
-    Ok(total)
+    Ok(Rendered { total_samples, segments })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sequence_in_order_and_loss() {
+        let mut s = None;
+        assert_eq!(advance_seq(&mut s, 100, 1 << 32), Some(0));
+        assert_eq!(advance_seq(&mut s, 101, 1 << 32), Some(0));
+        assert_eq!(advance_seq(&mut s, 104, 1 << 32), Some(2));
+    }
+
+    #[test]
+    fn sequence_duplicates_dropped() {
+        let mut s = None;
+        advance_seq(&mut s, 500, 1 << 32);
+        assert_eq!(advance_seq(&mut s, 500, 1 << 32), None);
+        assert_eq!(advance_seq(&mut s, 490, 1 << 32), None);
+        assert_eq!(s, Some(500));
+    }
+
+    #[test]
+    fn sequence_reset_starts_new_stream() {
+        // Seen in a real demo: a player's counter went 33291 -> 2 after a reconnect.
+        let mut s = None;
+        advance_seq(&mut s, 33291, 1 << 32);
+        assert_eq!(advance_seq(&mut s, 2, 1 << 32).map(|l| l > MAX_LOSS_FILL), Some(true));
+        assert_eq!(advance_seq(&mut s, 3, 1 << 32), Some(0));
+    }
+
+    #[test]
+    fn steam_sequence_wraps() {
+        let mut s = None;
+        advance_seq(&mut s, 0xFFFF, 1 << 16);
+        assert_eq!(advance_seq(&mut s, 0, 1 << 16), Some(0));
+        assert_eq!(advance_seq(&mut s, 0xFFFF, 1 << 16), None);
+    }
 }
